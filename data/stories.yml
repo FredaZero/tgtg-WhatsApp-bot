@@ -1,0 +1,47 @@
+version: "3.1"
+
+stories:
+
+- story: happy path
+  steps:
+  - intent: greet
+  - action: utter_greet
+  - intent: mood_great
+  - action: utter_happy
+
+- story: sad path 1
+  steps:
+  - intent: greet
+  - action: utter_greet
+  - intent: mood_unhappy
+  - action: utter_cheer_up
+  - action: utter_did_that_help
+  - intent: affirm
+  - action: utter_happy
+
+- story: sad path 2
+  steps:
+  - intent: greet
+  - action: utter_greet
+  - intent: mood_unhappy
+  - action: utter_cheer_up
+  - action: utter_did_that_help
+  - intent: deny
+  - action: utter_goodbye
+
+- story: check availability flow
+  steps:
+  - intent: check_availability
+  - action: action_check_tgtg
+
+- story: reserve flow
+  steps:
+  - intent: reserve_order
+  - action: action_reserve_tgtg
+  - intent: set_reminder
+  - action: action_set_reminder
+
+- story: monitor stock flow
+  steps:
+  - intent: monitor_stock
+  - action: action_monitor_stock
