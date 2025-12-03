@@ -15,6 +15,7 @@ intents:
 
 entities:
   - store
+  - email
 
 slots:
   store:
@@ -22,6 +23,11 @@ slots:
     mappings:
       - type: from_entity
         entity: store
+  email:
+  type: text
+  mappings:
+  - type: from_entity
+    entity: email
 
 actions:
   - action_check_tgtg
