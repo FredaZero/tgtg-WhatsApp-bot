@@ -23,7 +23,10 @@ GLOBAL_TGTG_CLIENT = TgtgClient(
     refresh_token=os.getenv("REFRESH_TOKEN"),
     cookie=os.getenv("COOKIE")
 )
-
+class ActionTGTGClientLogin(Action):
+    def name(self) -> Text:
+        return "action_tgtg_login"
+    
 
 class ActionCheckAvailability(Action):
 
