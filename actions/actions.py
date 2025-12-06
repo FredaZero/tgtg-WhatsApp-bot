@@ -10,7 +10,8 @@
 from typing import Any, Text, Dict, List
 from rasa_sdk import Action, Tracker
 from rasa_sdk.executor import CollectingDispatcher
-from rasa_sdk.events import FollowupAction
+from rasa_sdk.events import FollowupAction, SlotSet, Form
+from rasa_sdk.forms import FormValidationAction
 # Import your existing TGTG wrapper here
 from tgtg import TgtgClient
 from actions.items_summary import summarize_magic_bag
@@ -69,8 +70,51 @@ class ActionTgtgBase(Action):
 
 class ActionTGTGClientLogin(Action):
     def name(self) -> Text:
-        return "action_tgtg_login"
+        return "action_start_login_process"
+    def run(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+
+        dispatcher.utter_message(text="好的，让我们开始验证。")
+        
+        # 激活 login_form 并告诉 Rasa 从收集 'email' 槽位开始
+        return [
+            SlotSet("requested_slot", "email"),
+            FollowupAction("login_form") 
+        ]
     
+class ActionSubmitLoginForm(FormValidationAction):
+    def name(self) -> Text:
+        return "action_submit_login_form"
+
+    async def run(self, dispatcher, tracker, domain):
+        email = tracker.get_slot("email")
+        user_id = tracker.sender_id
+        
+        # 1. 触发 TGTG 登录 (发送邮件)
+        client = TgtgClient(email=email)
+        
+        # 2. 核心：调用 get_credentials，等待用户点击链接
+        # 注意：此方法通常是阻塞的，直到验证完成或超时
+        try:
+            dispatcher.utter_message(text=f"TGTG 已向 {email} 发送了认证邮件。请立即打开邮件并点击链接。")
+            
+            # **注意：在生产环境中，你可能需要用异步方式处理这里的阻塞**
+            # (例如：在另一个线程中轮询，或者让用户手动回复“我已点击”)
+            credentials = client.get_credentials() 
+            
+            # 3. 验证成功：保存 Token，退出 Form
+            tgtg_manager.save_credentials(user_id, credentials)
+            
+            dispatcher.utter_message(text="✅ 认证成功！我已经记住了你的身份，现在可以继续你的请求了。")
+            
+            # 退出 Form，并设置一个登录成功的 Slot
+            return [SlotSet("is_logged_in", True), SlotSet("email", email), Form(None)]
+            
+        except Exception as e:
+            dispatcher.utter_message(text="⚠️ 验证失败或超时。请再试一次。")
+            # 保持 Form 激活，让用户重新输入邮箱或取消
+            return [Form(self.name())]
 
 class ActionCheckAvailability(Action):
 

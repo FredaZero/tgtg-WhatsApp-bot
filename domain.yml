@@ -12,6 +12,7 @@ intents:
   - set_reminder
   - monitor_stock
   - reserve_order
+  - request_login
 
 entities:
   - store
