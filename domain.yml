@@ -29,6 +29,10 @@ slots:
   mappings:
   - type: from_entity
     entity: email
+  pickup_time:
+    type: text
+    mappings:
+      - type: custom
 
 actions:
   - action_check_tgtg

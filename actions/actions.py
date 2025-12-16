@@ -1,36 +1,26 @@
-# This files contains your custom actions which can be used to run
-# custom Python code.
-#
-# See this guide on how to implement these action:
-# https://rasa.com/docs/rasa/custom-actions
+# actions/actions.py
 
-
-# This is a simple example for a custom action which utters "Hello World!"
-
-from typing import Any, Text, Dict, List
-from rasa_sdk import Action, Tracker
+import logging
+from typing import Any, Text, Dict, List, Optional
+from rasa_sdk import Action, Tracker, FormValidationAction
 from rasa_sdk.executor import CollectingDispatcher
 from rasa_sdk.events import FollowupAction, SlotSet, Form
-from rasa_sdk.forms import FormValidationAction
-# Import your existing TGTG wrapper here
-from tgtg import TgtgClient
-from actions.items_summary import summarize_magic_bag
-from actions.client_mamager import tgtg_manager
-import os
-import argparse
-import dotenv
-dotenv.load_dotenv()
+from tgtg import TgtgClient, TgtgAPIError, TgtgLoginError
 
-GLOBAL_TGTG_CLIENT = TgtgClient(
-    access_token=os.getenv("ACCESS_TOKEN"),
-    refresh_token=os.getenv("REFRESH_TOKEN"),
-    cookie=os.getenv("COOKIE")
-)
+# Assuming you have implemented the manager as discussed previously
+from actions.client_manager import TGTGManager 
+from actions.items_summary import summarize_magic_bag
+from dateutil import parser # You might need: pip install python-dateutil
+
+logger = logging.getLogger(__name__)
 
 class ActionTgtgBase(Action):
     """
-    所有 TGTG 相关 Action 的父类。
-    它会自动处理 Client 获取和登录验证。
+    Base Class for all TGTG Actions.
+    Handles:
+    1. Getting the client for the specific user.
+    2. Auto-saving tokens if they were refreshed during the API call.
+    3. Catching Auth errors and forcing a re-login if tokens are dead.
     """
 
     def name(self) -> Text:
@@ -40,47 +30,68 @@ class ActionTgtgBase(Action):
             tracker: Tracker,
             domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
         
-        # 1. 统一获取 Client
         user_id = tracker.sender_id
-        client = tgtg_manager.get_client(user_id)
+        client = TGTGManager.get_client(user_id)
 
-        # 2. 统一拦截：如果没登录，或者 Token 失效
+        # 1. Intercept: User not logged in at all
         if not client:
-            dispatcher.utter_message(text="To proceed your request, I need to verify your identity")
-            # 3. 拦截后，强制跳转到登录流程
-            # 假设你有一个 action 叫 action_ask_email 或意图叫 enter_login_flow
+            dispatcher.utter_message(text="To proceed, I need to verify your identity with TGTG.")
             return [FollowupAction("action_start_login_process")]
 
-        # 4. 如果验证通过，调用子类的业务逻辑
-        # 我们定义一个新方法 run_authenticated 供子类实现
+        # 2. Try running the business logic
         try:
-            return self.run_authenticated(dispatcher, tracker, domain, client)
+            # We pass the client to the subclass
+            events = self.run_authenticated(dispatcher, tracker, domain, client)
+            
+            # 3. AUTO-REFRESH CHECK:
+            # If the library refreshed the token during the API call, we must save it.
+            # We compare the client's current tokens with what is in the DB.
+            TGTGManager.save_if_changed(user_id, client)
+            
+            return events
+
+        except (TgtgAPIError, TgtgLoginError) as e:
+            # 4. Handle Token Expiration
+            # If we get here, it means even the Refresh Token failed (or API is down).
+            logger.error(f"TGTG API Error for user {user_id}: {e}")
+            
+            # Check if it's an Auth error (usually 401 or 403)
+            # Note: exact status code checking depends on tgtg-python version, 
+            # but generally assuming fatal auth error here:
+            
+            dispatcher.utter_message(text="Your login session has expired. Let's authenticate you again.")
+            
+            # Clear old credentials so we don't loop
+            # (You need to implement a delete method in your manager, or just overwrite later)
+            # tgtg_manager.delete_credentials(user_id) 
+            
+            return [FollowupAction("action_start_login_process")]
+
         except Exception as e:
-            # 5. 统一异常处理（比如网络超时，或者 Token 刷新失败）
-            print(f"Error in {self.name()}: {e}")
-            dispatcher.utter_message(text="发生了一个连接错误，请稍后再试。")
+            logger.error(f"Unexpected error in {self.name()}: {e}", exc_info=True)
+            dispatcher.utter_message(text="I'm having trouble connecting to TGTG right now. Please try again later.")
             return []
 
     def run_authenticated(self, dispatcher, tracker, domain, client) -> List[Dict[Text, Any]]:
-        """
-        子类必须实现这个方法，而不是标准的 run 方法。
-        这里传进来的 client 保证是 100% 可用的。
-        """
         raise NotImplementedError("Subclasses must implement run_authenticated")
+
+
+# -------------------------------------------------------------------------
+# Login Flow
+# -------------------------------------------------------------------------
 
 class ActionTGTGClientLogin(Action):
     def name(self) -> Text:
         return "action_start_login_process"
+
     def run(self, dispatcher: CollectingDispatcher,
             tracker: Tracker,
             domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
-
-        dispatcher.utter_message(text="好的，让我们开始验证。")
         
-        # 激活 login_form 并告诉 Rasa 从收集 'email' 槽位开始
+        dispatcher.utter_message(text="Okay, I'll send a verification email to you.")
         return [
             SlotSet("requested_slot", "email"),
-            FollowupAction("login_form") 
+            Form("login_form") 
         ]
     
 class ActionSubmitLoginForm(FormValidationAction):
@@ -91,127 +102,186 @@ class ActionSubmitLoginForm(FormValidationAction):
         email = tracker.get_slot("email")
         user_id = tracker.sender_id
         
-        # 1. 触发 TGTG 登录 (发送邮件)
+        if not email:
+            dispatcher.utter_message(text="I need a valid email address.")
+            return [Form(self.name())]
+
         client = TgtgClient(email=email)
         
-        # 2. 核心：调用 get_credentials，等待用户点击链接
-        # 注意：此方法通常是阻塞的，直到验证完成或超时
         try:
-            dispatcher.utter_message(text=f"TGTG 已向 {email} 发送了认证邮件。请立即打开邮件并点击链接。")
+            dispatcher.utter_message(text=f"Sending email to {email}. Please check your inbox and click the link inside.")
             
-            # **注意：在生产环境中，你可能需要用异步方式处理这里的阻塞**
-            # (例如：在另一个线程中轮询，或者让用户手动回复“我已点击”)
+            # BLOCKING CALL: This waits for the user to click the link
             credentials = client.get_credentials() 
             
-            # 3. 验证成功：保存 Token，退出 Form
-            tgtg_manager.save_credentials(user_id, credentials)
+            # Save to DB
+            TGTGManager.save_credentials(user_id, credentials)
             
-            dispatcher.utter_message(text="✅ 认证成功！我已经记住了你的身份，现在可以继续你的请求了。")
+            dispatcher.utter_message(text="Authentication successful! You can now use the bot.")
             
-            # 退出 Form，并设置一个登录成功的 Slot
             return [SlotSet("is_logged_in", True), SlotSet("email", email), Form(None)]
             
         except Exception as e:
-            dispatcher.utter_message(text="⚠️ 验证失败或超时。请再试一次。")
-            # 保持 Form 激活，让用户重新输入邮箱或取消
-            return [Form(self.name())]
+            logger.error(f"Login failed: {e}")
+            dispatcher.utter_message(text="⚠️ Verification timed out or failed. Please try again.")
+            return [Form(None)] # Stop the form so they aren't stuck
 
-class ActionCheckAvailability(Action):
-
+# -------------------------------------------------------------------------
+# Business Logic
+# -------------------------------------------------------------------------
+class ActionCheckAvailability(ActionTgtgBase):
     def name(self) -> Text:
         return "action_check_tgtg"
 
-    def run(self, dispatcher: CollectingDispatcher,
+    def run_authenticated(self, dispatcher: CollectingDispatcher,
             tracker: Tracker,
-            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+            domain: Dict[Text, Any],
+            client: TgtgClient) -> List[Dict[Text, Any]]:
 
-        # 1. Get the store name entity from the user input
-        store_name = next(tracker.get_latest_entity_values("store"), None)
+        # 1. Get Store Name
+        store_name = tracker.get_slot("store") or next(tracker.get_latest_entity_values("store"), None)
 
         if not store_name:
             dispatcher.utter_message(text="Which store should I check?")
             return []
 
-        # 2. Call your TGTG API (Pseudo-code)
-        client = GLOBAL_TGTG_CLIENT
         items = client.get_items()
-        if store_name.lower() not in [item['store']['store_name'] for item in items]:
-            dispatcher.utter_message(text=f"I couldn't find {store_name} in your favorites.")
-            return []
         
-        # MOCK RESPONSE for demonstration
-        for i, payload in enumerate(items):
-            if payload['store']['store_name'].lower() == store_name.lower():
+        # 2. Find the matching item
+        target_payload = None
+        for item in items:
+            # Compare lowercase to be safe
+            if store_name.lower() in item['store']['store_name'].lower():
+                target_payload = item
                 break
-        else:
-            dispatcher.utter_message(text=f"I couldn't find {store_name} in your favorites.")
-            return []
-        item_summary = summarize_magic_bag(payload)
-        items_available = item_summary.get("remaining", 0)
         
-        if items_available > 0:
-            dispatcher.utter_message(text=f"Yes! {store_name} has {items_available} bags available.")
+        if not target_payload:
+            dispatcher.utter_message(text=f"I couldn't find '{store_name}' in your favorites list.")
+            return []
+        
+        # 3. USE YOUR CUSTOM FUNCTION
+        summary = summarize_magic_bag(target_payload)
+        
+        stock = summary.get('remaining', 0)
+        restaurant_name = summary.get('restaurant', store_name)
+        item_id = summary.get('id')
+        
+        if stock > 0:
+            # Optional: Add extra info like price or rating if available in your summary
+            price = summary.get('price', '')
+            dispatcher.utter_message(text=f"Yes! {restaurant_name} has {stock} bags available ({price}).")
+            
+            # Save vital data for subsequent actions (Ordering/Calendar)
+            return [
+                SlotSet("availability", str(stock)),
+                SlotSet("item_id", item_id),
+                SlotSet("store", restaurant_name) 
+            ]
         else:
-            dispatcher.utter_message(text=f"Sorry, nothing at {store_name} right now.")
+            dispatcher.utter_message(text=f"Sorry, nothing at {restaurant_name} right now.")
+            return []
 
-        return []
-
-class ActionCheckPickupTime(Action):
+class ActionCheckPickupTime(ActionTgtgBase):
     def name(self) -> Text:
         return "action_check_pickup_time"
 
-    def run(self, dispatcher: CollectingDispatcher,
+    def run_authenticated(self, dispatcher: CollectingDispatcher,
             tracker: Tracker,
-            domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+            domain: Dict[Text, Any],
+            client: TgtgClient) -> List[Dict[Text, Any]]:
             
-        items = GLOBAL_TGTG_CLIENT.get_items()
-        store_name = domain.get("store")
+        store_name = tracker.get_slot("store")
         if not store_name:
-            dispatcher.utter_message(text="Which store's pickup time should I check?")
+            dispatcher.utter_message(text="Which store are we talking about?")
             return []
         
-        if store_name.lower() not in [item['store']['store_name'] for item in items]:
-            dispatcher.utter_message(text=f"I couldn't find {store_name} in your favorites.")
-            return []
+        items = client.get_items()
         
-        # MOCK RESPONSE for demonstration
-        for i, payload in enumerate(items):
-            if payload['store']['store_name'].lower() == store_name.lower():
+        target_payload = None
+        for item in items:
+            if store_name.lower() in item['store']['store_name'].lower():
+                target_payload = item
                 break
-        else:
-            dispatcher.utter_message(text=f"I couldn't find {store_name} in your favorites.")
+
+        if not target_payload:
+            dispatcher.utter_message(text=f"Cannot find info for {store_name}.")
             return []
+
+        # 1. USE YOUR CUSTOM FUNCTION for the Message
+        summary = summarize_magic_bag(target_payload)
         
-        item_summary = summarize_magic_bag(payload)
+        # Your function returns a pretty string like "18:00 → 18:30"
+        readable_window = summary.get("pickup_window")
+
+        if readable_window:
+             dispatcher.utter_message(text=f"The pickup time for {summary['restaurant']} is: {readable_window}.")
+        else:
+             dispatcher.utter_message(text=f"The pickup time is currently unavailable.")
+
+        # 2. USE RAW DATA for the Slot (Calendar needs ISO format)
+        # We cannot easily parse "18:00 -> 18:30" back into a date object without knowing "Today" vs "Tomorrow".
+        # So we grab the raw start time from the original payload for the system to remember.
+        try:
+            raw_start_time = target_payload['pickup_interval']['start']
+        except (KeyError, TypeError):
+            raw_start_time = None
+
+        return [SlotSet("pickup_time", raw_start_time)]
+
+class ActionReserveOrder(ActionTgtgBase):
+    def name(self) -> Text:
+        return "action_reserve_tgtg"
+
+    def run_authenticated(self, dispatcher: CollectingDispatcher,
+            tracker: Tracker,
+            domain: Dict[Text, Any],
+            client: TgtgClient) -> List[Dict[Text, Any]]:
+            
+        # We rely on the Slot set by ActionCheckAvailability
+        item_id = tracker.get_slot("item_id")
         
-        # Call your TGTG API to get pickup time
-        # For demonstration, we will mock this
-        pickup_time = item_summary.get("pickup_window", "unknown")
-        
-        dispatcher.utter_message(text=f"The pickup time for {store_name} is {pickup_time}.")
+        if not item_id:
+            dispatcher.utter_message(text="I'm not sure which item you want to order. Please check stock first.")
+            return []
+            
+        try:
+            client.checkout(item_id)
+            dispatcher.utter_message(text="🎉 Order locked! Please complete payment in the TGTG app.")
+        except Exception as e:
+            dispatcher.utter_message(text=f"Failed to create order: {str(e)}")
         
         return []
     
-class ActionReserveOrder(Action):
+class ActionReminder(Action):
     def name(self) -> Text:
-        return "action_reserve_tgtg"
+        return "action_set_reminder"
 
     def run(self, dispatcher: CollectingDispatcher,
             tracker: Tracker,
             domain: Dict[Text, Any]) -> List[Dict[Text, Any]]:
+        
+        pickup_time_str = tracker.get_slot("pickup_time")
+        store_name = tracker.get_slot("store") or "TGTG Pickup"
+        
+        if not pickup_time_str:
+            dispatcher.utter_message(text="I don't have a pickup time saved. Please ask for the pickup time first.")
+            return []
+
+        try:
+            # 1. Parse the ISO string (e.g., '2023-10-27T18:00:00Z')
+            dt = parser.parse(pickup_time_str)
             
-        store_name = domain.get("store")
-        if not store_name:
-            dispatcher.utter_message(text="Which store should I reserve a bag from?")
-            return []
-        items = GLOBAL_TGTG_CLIENT.get_items()
-        if store_name.lower() not in [item['store']['store_name'] for item in items]:
-            dispatcher.utter_message(text=f"I couldn't find {store_name} in your favorites.")
-            return []
-        
-        # Call your TGTG API to reserve
-        # result = client.reserve(store_name)
-        
-        dispatcher.utter_message(text=f"I have attempted to reserve a bag at {store_name}. Check your app to confirm payment.")
+            # 2. Format for your Calendar Tool (Assuming format YYYYMMDDTHHMM)
+            formatted_time = dt.strftime("%Y%m%dT%H%M")
+            
+            # TODO
+            # --- GOOGLE CALENDAR LOGIC HERE ---
+            # result = google_calendar.create_event(summary=f"Food: {store_name}", start=formatted_time)
+            
+            dispatcher.utter_message(text=f"✅ I've added a reminder for {store_name} at {dt.strftime('%H:%M')} to your calendar.")
+            
+        except Exception as e:
+            logger.error(f"Calendar error: {e}")
+            dispatcher.utter_message(text="I couldn't process the date format for the calendar.")
         
         return []
